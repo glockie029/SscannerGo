@@ -61,13 +61,43 @@ func main() {
 
 	scanType = fmt.Sprintf("[%s]", *mode)
 
+	// 自动选择接口
+	if *mode == "syn" && *iface == "" {
+		ifaces, _ := net.Interfaces()
+		found := false
+		for _, i := range ifaces {
+			if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, _ := i.Addrs()
+			for _, addr := range addrs {
+				if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+					if ipnet.IP.To4() != nil {
+						*iface = i.Name
+						found = true
+						break
+					}
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if *iface != "" {
+			color.Yellow("[*] 自动选择接口: %s", *iface)
+		} else {
+			if os.Getenv("GOOS") == "darwin" {
+				*iface = "en0"
+			} else {
+				*iface = "eth0"
+			}
+			color.Yellow("[!] 未探测到活动接口，回退默认: %s", *iface)
+		}
+	}
+
 	if *mode == "syn" {
 		if os.Geteuid() != 0 {
 			color.Red("[!] SYN 扫描必须以 Root 权限运行 (sudo)")
-			return
-		}
-		if *iface == "" {
-			color.Red("[!] SYN 扫描必须指定网卡接口 (-iface), 例如 en0")
 			return
 		}
 
@@ -81,23 +111,63 @@ func main() {
 		}
 		tIP = tIP.To4()
 
-		// 确定 ARP 解析的目标 IP (是目标本身还是网关?)
-		arpTargetIP := tIP
-		// 如果用户指定了网关，则解析网关 MAC
-		if *gateway != "" {
-			arpTargetIP = net.ParseIP(*gateway).To4()
+		// 确定 ARP 解析目标
+		var arpTargetIP net.IP
+
+		// 获取本地接口信息以判断子网
+		ifaceObj, err := net.InterfaceByName(*iface)
+		if err != nil {
+			color.Red("[-] 无法获取接口 %s: %v", *iface, err)
+			return
+		}
+		addrs, _ := ifaceObj.Addrs()
+		var localIPNet *net.IPNet
+		var localIP net.IP
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				localIPNet = ipnet
+				localIP = ipnet.IP.To4()
+				break
+			}
+		}
+
+		if localIPNet != nil && localIPNet.Contains(tIP) {
+			arpTargetIP = tIP
+			color.Green("[*] 目标在本地子网，直接解析目标 MAC")
 		} else {
-			// 这里应该有一个检查: 如果目标不在同一子网，提示用户指定网关
-			// 为简化，暂且尝试直接解析目标，如果失败则由用户判断
+			// 目标在外网，需要发给网关
+			if *gateway != "" {
+				arpTargetIP = net.ParseIP(*gateway).To4()
+			} else {
+				// 自动猜测网关: 本机IP所在网段的 .1
+				if localIP != nil {
+					ipv4 := localIP
+					// 假设网关是 x.x.x.1 或者 x.x.x.2 (通常是 .1)
+					// 取掩码
+					mask := localIPNet.Mask
+					network := ipv4.Mask(mask)
+
+					// 构造 网段 IP
+					gwIP := make(net.IP, len(network))
+					copy(gwIP, network)
+					gwIP[3] = gwIP[3] + 1 // 假设最后一位是 x.x.x.1
+
+					arpTargetIP = gwIP
+					color.Yellow("[!] 目标在外网，自动推测网关为: %s", gwIP.String())
+				} else {
+					color.Red("[-] 无法获取本地IP来推测网关，请使用 -gw 指定")
+					return
+				}
+			}
 		}
 
 		color.Yellow("[*] 正在解析 MAC 地址: %s...", arpTargetIP)
 		dstMac, err := portscan.GetMacByIP(*iface, arpTargetIP)
 		if err != nil {
-			color.Red("[-] ARP 解析失败: %v (如果目标在外网，请使用 -gw 指定网关IP)", err)
+			color.Red("[-] ARP 解析失败: %v (请确认目标/网关可达)", err)
 			return
 		}
-		color.Green("[+] 目标 MAC: %s", dstMac)
+		color.Green("[+] 下一跳 MAC: %s", dstMac)
 
 		synScanner, err := portscan.NewSynScanner(*iface, *targetIP, dstMac)
 		if err != nil {
