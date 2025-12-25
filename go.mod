@@ -1,6 +1,6 @@
 module SscannerGo
 
-go 1.23
+go 1.21
 
 require github.com/schollz/progressbar/v3 v3.14.1
 
